@@ -1,0 +1,8 @@
+name: speedtest
+on: workflow_dispatch
+jobs:
+  speedtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: gcc -O3 -march=native -o speedtest speedtest.c -lssl -lcrypto && ./speedtest
