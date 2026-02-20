@@ -1,272 +1,489 @@
 /*
- * speedtest.c — оценка пропускной способности сети (download)
+ * speedtest.c — multi-threaded bandwidth test via Cloudflare
  *
- * Компиляция:
- *   gcc -O2 -o speedtest speedtest.c
+ * Compile:
+ *   Linux:  gcc -O2 -pthread -o speedtest speedtest.c
+ *   macOS:  clang -O2 -pthread -o speedtest speedtest.c
  *
- * Использование:
- *   ./speedtest                  # 3 прогона по ~100 MB
- *   ./speedtest 25000000 5       # 5 прогонов по ~25 MB
+ * Run:
+ *   ./speedtest                          # auto (4*CPUs connections, 15s)
+ *   ./speedtest -n 256 -t 20            # 256 connections, 20 seconds
+ *   ./speedtest -n 512 -b 500000000     # 512 conns, 500 MB per request
+ *
+ * Kernel tuning for 10 Gbps+ (Linux):
+ *   sysctl -w net.core.rmem_max=67108864
+ *   sysctl -w net.core.wmem_max=67108864
+ *   sysctl -w net.ipv4.tcp_rmem="4096 1048576 67108864"
+ *   sysctl -w net.core.netdev_max_backlog=50000
+ *   sysctl -w net.ipv4.tcp_max_syn_backlog=30000
+ *   sysctl -w net.core.somaxconn=65535
+ *   ulimit -n 65535
  */
+
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 
-#define HOST            "speed.cloudflare.com"
-#define PORT            "80"
-#define DEFAULT_BYTES   99999999L
-#define DEFAULT_RUNS    3
-#define READ_BUF        (128 * 1024)
-#define RCVBUF_SIZE     (1 * 1024 * 1024)
+#ifdef __linux__
+#include <sched.h>
+#endif
 
-/* ─── Монотонные часы ─── */
+/* ═══════════════════════════════════════════════
+ *  Configuration
+ * ═══════════════════════════════════════════════ */
 
-static double now_sec(void)
+#define HOST          "speed.cloudflare.com"
+#define PORT          "80"
+#define RDBUF_SZ      (512 * 1024)         /* 512 KiB read buffer/thread   */
+#define SOBUF_SZ      (8  * 1024 * 1024)   /* SO_RCVBUF hint: 8 MiB        */
+#define FLUSH_EVERY   (4  * 1024 * 1024)   /* flush atomic every 4 MiB     */
+#define HDR_MAX       4096                 /* max HTTP header size          */
+#define STACK_SZ      (256 * 1024)         /* thread stack: 256 KiB        */
+#define DEF_BYTES     100000000L           /* 100 MB per request            */
+#define DEF_DUR       15                   /* test duration: 15 seconds     */
+
+/* ═══════════════════════════════════════════════
+ *  Shared atomic counters
+ * ═══════════════════════════════════════════════ */
+
+static _Atomic long long g_bytes = 0;     /* total body bytes received     */
+static _Atomic int       g_run   = 1;     /* 0 → workers stop             */
+static _Atomic int       g_act   = 0;     /* active connections now        */
+static _Atomic long long g_ok    = 0;     /* completed downloads           */
+static _Atomic long long g_err   = 0;     /* failed attempts               */
+
+/* ═══════════════════════════════════════════════
+ *  Cached DNS result
+ * ═══════════════════════════════════════════════ */
+
+#define MAX_ADDRS 8
+static struct sockaddr_storage g_addrs[MAX_ADDRS];
+static socklen_t               g_addrlens[MAX_ADDRS];
+static int                     g_naddrs = 0;
+static char                    g_ip_str[INET6_ADDRSTRLEN];
+
+/* ═══════════════════════════════════════════════
+ *  Helpers
+ * ═══════════════════════════════════════════════ */
+
+static double mono(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* ─── Прогресс-бар ─── */
-
-static void print_progress(long long received, long long expected, double elapsed)
+static int cpu_count(void)
 {
-    double pct   = expected > 0 ? (double)received / expected * 100.0 : 0;
-    double mb    = received / 1e6;
-    double speed = elapsed > 0.001 ? (received * 8.0 / 1e6) / elapsed : 0;
-
-    fprintf(stderr, "\r  [%5.1f%%]  %.2f / %.2f MB   %8.2f Mbps",
-            pct, mb, expected / 1e6, speed);
-    fflush(stderr);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
 }
 
-/* ─── TCP-соединение ─── */
-
-static int tcp_connect(const char *host, const char *port)
+static void on_signal(int s)
 {
-    struct addrinfo hints, *res, *rp;
-    memset(&hints, 0, sizeof(hints));
+    (void)s;
+    atomic_store_explicit(&g_run, 0, memory_order_relaxed);
+}
+
+static void fmt_speed(double mbps, char *buf, size_t sz)
+{
+    if      (mbps >= 1000.0) snprintf(buf, sz, "%7.2f Gbps", mbps / 1000.0);
+    else                     snprintf(buf, sz, "%7.2f Mbps", mbps);
+}
+
+/* ═══════════════════════════════════════════════
+ *  DNS — resolve once, reuse for every connect
+ * ═══════════════════════════════════════════════ */
+
+static int dns_resolve(void)
+{
+    struct addrinfo hints = {0}, *res, *rp;
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "getaddrinfo(%s): %s\n", host, gai_strerror(rc));
+    int rc = getaddrinfo(HOST, PORT, &hints, &res);
+    if (rc) {
+        fprintf(stderr, "DNS error for %s: %s\n", HOST, gai_strerror(rc));
         return -1;
     }
 
-    int fd = -1;
-    for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+    /* store all returned addresses for round-robin */
+    g_naddrs = 0;
+    for (rp = res; rp && g_naddrs < MAX_ADDRS; rp = rp->ai_next) {
+        memcpy(&g_addrs[g_naddrs], rp->ai_addr, rp->ai_addrlen);
+        g_addrlens[g_naddrs] = rp->ai_addrlen;
+        g_naddrs++;
     }
+
+    /* pretty-print first address */
+    void *addr = (res->ai_family == AF_INET)
+        ? (void *)&((struct sockaddr_in  *)res->ai_addr)->sin_addr
+        : (void *)&((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
+    inet_ntop(res->ai_family, addr, g_ip_str, sizeof g_ip_str);
+
     freeaddrinfo(res);
+    return g_naddrs > 0 ? 0 : -1;
+}
 
-    if (fd < 0) {
-        fprintf(stderr, "Не удалось подключиться к %s:%s\n", host, port);
+/* ═══════════════════════════════════════════════
+ *  TCP connect with tuned socket
+ * ═══════════════════════════════════════════════ */
+
+static int tcp_connect(int addr_idx)
+{
+    int i  = addr_idx % g_naddrs;
+    int fd = socket(g_addrs[i].ss_family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    if (connect(fd, (struct sockaddr *)&g_addrs[i], g_addrlens[i]) < 0) {
+        close(fd);
         return -1;
     }
 
-    int rcvbuf = RCVBUF_SIZE;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
+    int val;
+    val = SOBUF_SZ;  setsockopt(fd, SOL_SOCKET,  SO_RCVBUF,   &val, sizeof val);
+    val = 1;         setsockopt(fd, IPPROTO_TCP,  TCP_NODELAY, &val, sizeof val);
+#ifdef TCP_QUICKACK
+    val = 1;         setsockopt(fd, IPPROTO_TCP,  TCP_QUICKACK,&val, sizeof val);
+#endif
     return fd;
 }
 
-/* ─── Поиск подстроки без учёта регистра ─── */
+/* ═══════════════════════════════════════════════
+ *  Full write helper
+ * ═══════════════════════════════════════════════ */
 
-static char *my_strcasestr(const char *haystack, const char *needle)
+static int write_all(int fd, const void *data, int len)
 {
-    size_t nlen = strlen(needle);
-    if (nlen == 0) return (char *)haystack;
-    for (; *haystack; haystack++) {
-        if (strncasecmp(haystack, needle, nlen) == 0)
-            return (char *)haystack;
+    const char *p = data;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n <= 0) return -1;
+        p   += n;
+        len -= (int)n;
     }
-    return NULL;
-}
-
-/* ─── Один прогон загрузки ─── */
-
-typedef struct {
-    long long body_bytes;
-    double    elapsed;
-    int       http_status;
-} download_result_t;
-
-static int run_download(long req_bytes, download_result_t *out)
-{
-    memset(out, 0, sizeof(*out));
-
-    /* 1. TCP-соединение */
-    int fd = tcp_connect(HOST, PORT);
-    if (fd < 0) return -1;
-
-    /* 2. HTTP-запрос */
-    char req[512];
-    int rlen = snprintf(req, sizeof(req),
-            "GET /__down?bytes=%ld HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "User-Agent: speedtest-c/1.0\r\n"
-            "Accept: */*\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            req_bytes, HOST);
-
-    ssize_t sent = 0;
-    while (sent < rlen) {
-        ssize_t n = write(fd, req + sent, rlen - sent);
-        if (n <= 0) {
-            fprintf(stderr, "write() failed: %s\n", strerror(errno));
-            close(fd);
-            return -1;
-        }
-        sent += n;
-    }
-
-    /* 3. Чтение ответа */
-    char *buf = malloc(READ_BUF);
-    if (!buf) { close(fd); return -1; }
-
-    char  *hdr_buf      = NULL;
-    int    hdr_len       = 0;
-    int    headers_done  = 0;
-    long long content_length = req_bytes;
-
-    double    t_start    = 0;
-    long long total_body = 0;
-
-    for (;;) {
-        ssize_t n = read(fd, buf, READ_BUF);
-        if (n <= 0) break;
-
-        if (!headers_done) {
-            hdr_buf = realloc(hdr_buf, hdr_len + n + 1);
-            if (!hdr_buf) { free(buf); close(fd); return -1; }
-            memcpy(hdr_buf + hdr_len, buf, n);
-            hdr_len += n;
-            hdr_buf[hdr_len] = '\0';
-
-            char *sep = strstr(hdr_buf, "\r\n\r\n");
-            if (!sep) continue;
-
-            sep += 4;
-            int body_in_hdr = hdr_len - (int)(sep - hdr_buf);
-
-            /* HTTP-статус */
-            if (sscanf(hdr_buf, "HTTP/%*s %d", &out->http_status) != 1)
-                out->http_status = 0;
-
-            /* Content-Length */
-            const char *cl = my_strcasestr(hdr_buf, "Content-Length:");
-            if (cl) content_length = atoll(cl + 15);
-
-            headers_done = 1;
-            t_start      = now_sec();
-            total_body   = body_in_hdr;
-
-            free(hdr_buf);
-            hdr_buf = NULL;
-
-            print_progress(total_body, content_length, 0);
-        } else {
-            total_body += n;
-            print_progress(total_body, content_length, now_sec() - t_start);
-        }
-    }
-
-    double t_end = now_sec();
-    free(buf);
-
-    fprintf(stderr, "\r%70s\r", "");
-
-    if (!headers_done) {
-        fprintf(stderr, "Не удалось получить заголовки HTTP\n");
-        if (hdr_buf) free(hdr_buf);
-        close(fd);
-        return -1;
-    }
-
-    out->body_bytes = total_body;
-    out->elapsed    = t_end - t_start;
-    if (out->elapsed < 1e-6) out->elapsed = 1e-6;
-
-    close(fd);
     return 0;
 }
 
-/* ─── main ─── */
+/* ═══════════════════════════════════════════════
+ *  Worker thread
+ * ═══════════════════════════════════════════════ */
 
-int main(int argc, char *argv[])
+typedef struct {
+    int  id;
+    long req_bytes;
+} worker_arg_t;
+
+static void *worker_fn(void *arg)
 {
-    long download_bytes = DEFAULT_BYTES;
-    int  num_runs       = DEFAULT_RUNS;
+    worker_arg_t *wa = arg;
 
-    if (argc > 1) download_bytes = atol(argv[1]);
-    if (argc > 2) num_runs       = atoi(argv[2]);
-    if (download_bytes <= 0) download_bytes = DEFAULT_BYTES;
-    if (num_runs <= 0)       num_runs       = DEFAULT_RUNS;
+    /* pin to CPU core (Linux only) */
+#ifdef __linux__
+    {
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(wa->id % cpu_count(), &cs);
+        pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+    }
+#endif
 
-    printf("======================================\n");
-    printf("    Network Speed Test (download)\n");
-    printf("======================================\n\n");
-    printf("  Сервер:        %s:%s\n", HOST, PORT);
-    printf("  Размер:        %.2f MB\n", download_bytes / 1e6);
-    printf("  Кол-во тестов: %d\n\n", num_runs);
+    /* pre-format HTTP request */
+    char req[512];
+    int  rlen = snprintf(req, sizeof req,
+            "GET /__down?bytes=%ld HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            wa->req_bytes, HOST);
 
-    double speeds[num_runs];
-    int    ok = 0;
+    /* per-thread read buffer */
+    char *buf = malloc(RDBUF_SZ);
+    if (!buf) return NULL;
 
-    for (int i = 0; i < num_runs; i++) {
-        printf("  Тест %d/%d …\n", i + 1, num_runs);
+    int conn_num = 0;
 
-        download_result_t res;
-        if (run_download(download_bytes, &res) < 0) {
-            printf("    ОШИБКА: соединение не удалось\n\n");
+    /* ── main loop: connect → download → repeat ── */
+    while (atomic_load_explicit(&g_run, memory_order_relaxed)) {
+
+        /* connect */
+        int fd = tcp_connect(wa->id + conn_num++);
+        if (fd < 0) {
+            atomic_fetch_add_explicit(&g_err, 1, memory_order_relaxed);
+            usleep(50000);          /* 50 ms backoff */
             continue;
         }
+        atomic_fetch_add_explicit(&g_act, 1, memory_order_relaxed);
 
-        if (res.http_status != 200) {
-            printf("    ОШИБКА: HTTP %d\n\n", res.http_status);
-            continue;
+        /* send HTTP request */
+        if (write_all(fd, req, rlen) < 0)
+            goto fail;
+
+        /* ── Phase 1: read & skip HTTP headers ── */
+        char hdr[HDR_MAX];
+        int  hdr_len  = 0;
+        int  body_off = -1;
+        long long batch = 0;
+
+        while (body_off < 0) {
+            if (!atomic_load_explicit(&g_run, memory_order_relaxed))
+                goto done;
+
+            int space = HDR_MAX - hdr_len - 1;
+            if (space <= 0) goto fail;          /* headers impossibly large */
+
+            ssize_t n = read(fd, hdr + hdr_len, space);
+            if (n <= 0) goto done;
+
+            hdr_len    += (int)n;
+            hdr[hdr_len] = '\0';
+
+            char *sep = strstr(hdr, "\r\n\r\n");
+            if (sep) {
+                body_off = (int)(sep + 4 - hdr);
+
+                /* check HTTP status */
+                int status = 0;
+                sscanf(hdr, "HTTP/%*s %d", &status);
+                if (status != 200) goto fail;
+
+                /* body bytes already in header buffer */
+                batch = hdr_len - body_off;
+            }
         }
 
-        double mbps = (res.body_bytes * 8.0 / 1e6) / res.elapsed;
-        speeds[ok++] = mbps;
+        /* ── Phase 2: read body as fast as possible ── */
+        for (;;) {
+            if (!atomic_load_explicit(&g_run, memory_order_relaxed))
+                break;
 
-        printf("    Получено: %.2f MB за %.2f с  =>  %.2f Mbps\n\n",
-               res.body_bytes / 1e6, res.elapsed, mbps);
+            ssize_t n = read(fd, buf, RDBUF_SZ);
+            if (n <= 0) break;
+
+            batch += n;
+            if (batch >= FLUSH_EVERY) {
+                atomic_fetch_add_explicit(&g_bytes, batch,
+                                          memory_order_relaxed);
+                batch = 0;
+            }
+        }
+
+        /* flush remaining batch */
+        if (batch > 0)
+            atomic_fetch_add_explicit(&g_bytes, batch,
+                                      memory_order_relaxed);
+
+        close(fd);
+        atomic_fetch_sub_explicit(&g_act, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_ok,  1, memory_order_relaxed);
+        continue;
+
+    fail:
+        close(fd);
+        atomic_fetch_sub_explicit(&g_act, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_err, 1, memory_order_relaxed);
+        usleep(20000);
+        continue;
+
+    done:
+        if (batch > 0)
+            atomic_fetch_add_explicit(&g_bytes, batch,
+                                      memory_order_relaxed);
+        close(fd);
+        atomic_fetch_sub_explicit(&g_act, 1, memory_order_relaxed);
     }
 
-    if (ok == 0) {
-        printf("  Все тесты завершились с ошибкой.\n");
-        return EXIT_FAILURE;
+    free(buf);
+    return NULL;
+}
+
+/* ═══════════════════════════════════════════════
+ *  main
+ * ═══════════════════════════════════════════════ */
+
+int main(int argc, char **argv)
+{
+    long req_bytes = DEF_BYTES;
+    int  duration  = DEF_DUR;
+    int  nconn     = 0;                    /* 0 = auto */
+
+    /* ── parse args ── */
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "-n") && i+1 < argc)
+            nconn    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t") && i+1 < argc)
+            duration = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-b") && i+1 < argc)
+            req_bytes = atol(argv[++i]);
+        else {
+            fprintf(stderr,
+                "Usage: %s [-n connections] [-t seconds] [-b bytes_per_req]\n\n"
+                "  -n  Parallel HTTP connections (default: auto = CPU*4, min 64)\n"
+                "  -t  Test duration in seconds  (default: %d)\n"
+                "  -b  Bytes per HTTP request     (default: %ld = %.0f MB)\n\n"
+                "  For 10+ Gbps: use -n 256 or higher\n"
+                "  For 40+ Gbps: use -n 512, -b 500000000, tune kernel\n\n",
+                argv[0], DEF_DUR, DEF_BYTES, DEF_BYTES / 1e6);
+            return 1;
+        }
     }
 
-    double sum = 0, best = 0, worst = 1e18;
-    for (int i = 0; i < ok; i++) {
-        sum += speeds[i];
-        if (speeds[i] > best)  best  = speeds[i];
-        if (speeds[i] < worst) worst = speeds[i];
+    int ncpu = cpu_count();
+    if (nconn <= 0) nconn = ncpu * 4;
+    if (nconn < 64) nconn = 64;           /* minimum for high-bw links */
+    if (duration  <= 0) duration  = DEF_DUR;
+    if (req_bytes <= 0) req_bytes = DEF_BYTES;
+
+    /* signals */
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+
+    /* ── banner ── */
+    printf("\n");
+    printf("  ==================================================\n");
+    printf("   Multi-Threaded Bandwidth Test  %s:%s\n", HOST, PORT);
+    printf("  ==================================================\n");
+    printf("   CPU cores       : %d\n",    ncpu);
+    printf("   Connections     : %d\n",    nconn);
+    printf("   Per-request     : %.0f MB\n", req_bytes / 1e6);
+    printf("   Duration        : %d s\n",  duration);
+    printf("   Read buffer     : %d KiB/thread\n", RDBUF_SZ / 1024);
+    printf("   SO_RCVBUF       : %d MiB\n", SOBUF_SZ / (1024*1024));
+    printf("   Thread memory   : ~%.0f MB total\n",
+           nconn * (RDBUF_SZ + STACK_SZ) / 1e6);
+
+    /* ── DNS ── */
+    printf("   Resolving DNS   : ");
+    fflush(stdout);
+    if (dns_resolve() < 0) return 1;
+    printf("%s (%d addresses)\n\n", g_ip_str, g_naddrs);
+
+    /* ── spawn worker threads ── */
+    pthread_t    *threads = calloc(nconn, sizeof *threads);
+    worker_arg_t *args    = calloc(nconn, sizeof *args);
+    if (!threads || !args) { perror("calloc"); return 1; }
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, STACK_SZ);
+
+    double t0 = mono();
+
+    for (int i = 0; i < nconn; i++) {
+        args[i].id        = i;
+        args[i].req_bytes = req_bytes;
+        if (pthread_create(&threads[i], &attr, worker_fn, &args[i]) != 0) {
+            fprintf(stderr, "pthread_create #%d failed: %s\n",
+                    i, strerror(errno));
+            nconn = i;
+            break;
+        }
+    }
+    pthread_attr_destroy(&attr);
+
+    if (nconn == 0) {
+        fprintf(stderr, "No threads created.\n");
+        return 1;
     }
 
-    printf("  +------------------------------------+\n");
-    printf("  |  Средняя скорость: %8.2f Mbps   |\n", sum / ok);
-    printf("  |  Лучшая:          %8.2f Mbps   |\n", best);
-    printf("  |  Худшая:          %8.2f Mbps   |\n", worst);
-    printf("  |  Успешных тестов:  %d / %d            |\n", ok, num_runs);
-    printf("  +------------------------------------+\n");
+    /* ── monitor loop: print stats every second ── */
+    printf("    Time | Conns |    Speed (1s)   |   Avg Speed     "
+           "| Downloaded |  DL#\n");
+    printf("   ------|-------|-----------------|---------------"
+           "--|------------|------\n");
 
-    return EXIT_SUCCESS;
+    long long prev_bytes = 0;
+    double    prev_time  = t0;
+    double    peak_mbps  = 0;
+
+    while (atomic_load_explicit(&g_run, memory_order_relaxed)) {
+        usleep(1000000);                   /* 1 second */
+
+        double    now   = mono();
+        double    total = now - t0;
+        long long cur   = atomic_load_explicit(&g_bytes, memory_order_relaxed);
+        int       act   = atomic_load_explicit(&g_act,   memory_order_relaxed);
+        long long ok    = atomic_load_explicit(&g_ok,    memory_order_relaxed);
+        long long err   = atomic_load_explicit(&g_err,   memory_order_relaxed);
+
+        /* interval (1s) speed */
+        double dt   = now - prev_time;
+        double inst = dt > 0 ? ((cur - prev_bytes) * 8.0 / 1e6) / dt : 0;
+
+        /* cumulative average speed */
+        double avg  = total > 0 ? (cur * 8.0 / 1e6) / total : 0;
+
+        if (inst > peak_mbps) peak_mbps = inst;
+
+        char s_inst[32], s_avg[32];
+        fmt_speed(inst, s_inst, sizeof s_inst);
+        fmt_speed(avg,  s_avg,  sizeof s_avg);
+
+        printf("   %4.0fs  |  %4d | %s  |  %s  | %7.2f GB  | %lld",
+               total, act, s_inst, s_avg, cur / 1e9, (long long)ok);
+        if (err > 0)
+            printf("  (err:%lld)", (long long)err);
+        printf("\n");
+        fflush(stdout);
+
+        prev_bytes = cur;
+        prev_time  = now;
+
+        if (total >= duration)
+            atomic_store_explicit(&g_run, 0, memory_order_relaxed);
+    }
+
+    /* ── join all threads ── */
+    printf("\n   Stopping threads...");
+    fflush(stdout);
+
+    for (int i = 0; i < nconn; i++)
+        pthread_join(threads[i], NULL);
+
+    printf(" done.\n");
+
+    /* ── final results ── */
+    double    T    = mono() - t0;
+    long long B    = atomic_load(&g_bytes);
+    long long OK   = atomic_load(&g_ok);
+    long long ERR  = atomic_load(&g_err);
+    double    avg  = T > 0 ? (B * 8.0 / 1e6) / T : 0;
+
+    char s_avg[32], s_peak[32];
+    fmt_speed(avg,      s_avg,  sizeof s_avg);
+    fmt_speed(peak_mbps, s_peak, sizeof s_peak);
+
+    printf("\n");
+    printf("   +============================================+\n");
+    printf("   |              R E S U L T S                 |\n");
+    printf("   +============================================+\n");
+    printf("   |  Average speed  :  %-22s  |\n", s_avg);
+    printf("   |  Peak (1s)      :  %-22s  |\n", s_peak);
+    printf("   |  Downloaded     :  %8.2f GB              |\n", B / 1e9);
+    printf("   |  Duration       :  %8.2f s               |\n", T);
+    printf("   |  Connections    :  %5d                    |\n", nconn);
+    printf("   |  Completed DLs  :  %5lld                    |\n",
+           (long long)OK);
+    if (ERR > 0)
+    printf("   |  Errors         :  %5lld                    |\n",
+           (long long)ERR);
+    printf("   +============================================+\n\n");
+
+    free(threads);
+    free(args);
+    return 0;
 }
